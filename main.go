@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,7 @@ type RSSItem struct {
 }
 
 const dbURL = "postgres://postgres:postgres@localhost:5432/gator"
+const dateFormatString = "Mon, 02 Jan 2006 15:04:05 -0700"
 
 func main() {
 	db, err := sql.Open("postgres", dbURL)
@@ -70,10 +72,12 @@ func main() {
 	cmdMap.register("reset", handlerReset)
 	cmdMap.register("users", handlerUsers)
 	cmdMap.register("agg", handlerAgg)
-	cmdMap.register("addfeed", handlerAddFeed)
+	cmdMap.register("addfeed", middlewareLoggedIn(handlerAddFeed))
 	cmdMap.register("feeds", handlerFeeds)
-	cmdMap.register("follow", handlerFollow)
-	cmdMap.register("following", handlerFollowing)
+	cmdMap.register("follow", middlewareLoggedIn(handlerFollow))
+	cmdMap.register("following", middlewareLoggedIn(handlerFollowing))
+	cmdMap.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmdMap.register("browse", middlewareLoggedIn(handlerBrowse))
 	args := os.Args
 	if len(args) < 2 {
 		fmt.Println(fmt.Errorf("command name required"))
@@ -159,32 +163,24 @@ func handlerReset(s *state, cmd command) error {
 }
 
 func handlerAgg(s *state, cmd command) error {
-	url := "https://www.wagslane.dev/index.xml"
-	rssStruct, err := fetchFeed(context.Background(), url)
+	if len(cmd.arguments) < 1 {
+		return fmt.Errorf("agg command requires a \"time_between_reqs\" argument")
+	}
+	timeBetweenReqs := cmd.arguments[0]
+	timeDuration, err := time.ParseDuration(timeBetweenReqs)
 	if err != nil {
 		return err
 	}
-	rssStruct.Channel.Title = html.EscapeString(rssStruct.Channel.Title)
-	rssStruct.Channel.Description = html.EscapeString(rssStruct.Channel.Description)
-
-	for _, item := range rssStruct.Channel.Item {
-		item.Title = html.EscapeString(item.Title)
-		item.Description = html.EscapeString(item.Description)
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenReqs)
+	ticker := time.NewTicker(timeDuration)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
 	}
-
-	fmt.Println(rssStruct)
-
-	return nil
 }
 
-func handlerAddFeed(s *state, cmd command) error {
+func handlerAddFeed(s *state, cmd command, currentUser database.User) error {
 	if len(cmd.arguments) < 2 {
 		return fmt.Errorf("addfeed command requires 2 arguments")
-	}
-
-	currentUser, err := s.db.GetUser(context.Background(), s.cfg.Current_user_name)
-	if err != nil {
-		return err
 	}
 
 	feedName := cmd.arguments[0]
@@ -195,14 +191,8 @@ func handlerAddFeed(s *state, cmd command) error {
 		ID:			uuid.New(),
 		CreatedAt:  time.Now(),
 		UpdatedAt:	time.Now(),
-		Name:		sql.NullString{
-			String: feedName,
-			Valid:	true,
-		},
-		Url:		sql.NullString{
-			String: url,
-			Valid:	true,
-		},
+		Name:		feedName,
+		Url:		url,
 		UserID:		uuid.NullUUID{
 			UUID: 	currentUser.ID,
 			Valid:	true,
@@ -212,7 +202,29 @@ func handlerAddFeed(s *state, cmd command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(feed)
+
+	followParams := database.CreateFeedFollowParams{
+		ID:			uuid.New(),
+		CreatedAt:  time.Now(),
+		UpdatedAt:	time.Now(),
+		UserID: 	uuid.NullUUID{
+			UUID: 	currentUser.ID,
+			Valid: 	true,
+		},
+		FeedID: 	uuid.NullUUID{
+			UUID: 	feed.ID,
+			Valid: 	true,
+		},
+	}
+	_, err = s.db.CreateFeedFollow(context.Background(), followParams)
+	
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Feed follow created for url \"%s\" by user \"%s\"\n", 
+				feed.Url, currentUser.Name)
+
 
 	return nil
 }
@@ -229,24 +241,20 @@ func handlerFeeds(s *state, cmd command) error {
 			return err
 		}
 		fmt.Printf("Name: %s | Url: %s | User: %s\n", 
-				feed.Name.String, feed.Url.String, user.Name)
+				feed.Name, feed.Url, user.Name)
 	}
 	return nil
 }
 
-func handlerFollow(s *state, cmd command) error {
+func handlerFollow(s *state, cmd command, currentUser database.User) error {
 	if len(cmd.arguments) < 1 {
 		return fmt.Errorf("follow command requires url argument")
 	}
 	url := cmd.arguments[0]
 	
-	currentUser, err := s.db.GetUser(context.Background(), s.cfg.Current_user_name)
+	feed, err := s.db.GetFeedFromURL(context.Background(), url)
 	if err != nil {
-		return err
-	}
-
-	feed, err := s.db.GetFeedFromURL(context.Background(), sql.NullString{String: url})
-	if err != nil {
+		fmt.Println("feed not found")
 		return err
 	}
 
@@ -270,26 +278,72 @@ func handlerFollow(s *state, cmd command) error {
 	}
 
 	fmt.Printf("Feed follow created for url \"%s\" by user \"%s\"\n", 
-				feed.Url.String, currentUser.Name)
+				feed.Url, currentUser.Name)
 
 	return nil
 }
 
-func handlerFollowing(s *state, cmd command) error {
-	currentUser, err := s.db.GetUser(context.Background(), s.cfg.Current_user_name)
-	if err != nil {
-		return err
-	}
+func handlerFollowing(s *state, cmd command, currentUser database.User) error {
 
-	feeds, err := s.db.GetFeedFollowsForUser(context.Background(), uuid.NullUUID{UUID: currentUser.ID})
+	feeds, err := s.db.GetFeedFollowsForUser(context.Background(), uuid.NullUUID{UUID: currentUser.ID, Valid: true})
 	if err != nil {
 		return err
 	}
 
 	for _, feed := range feeds {
-		fmt.Println(feed.Name)
+		fmt.Println(feed.FeedName)
 	}
 
+	return nil
+}
+
+func handlerUnfollow(s *state, cmd command, currentUser database.User) error {
+	if len(cmd.arguments) < 1 {
+		return fmt.Errorf("unfollow command requires a \"url\" argument")
+	}
+
+	params := database.DeleteFeedFollowForUserParams{
+		UserID:	uuid.NullUUID{
+			UUID:	currentUser.ID,
+			Valid:	true,
+		},
+		Url: 	cmd.arguments[0],	
+	}
+	err := s.db.DeleteFeedFollowForUser(context.Background(), params)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func handlerBrowse(s *state, cmd command, currentUser database.User) error {
+	// default to 2 posts
+	numPostsToGet := 2
+	if len(cmd.arguments) >= 1 {
+		var err error
+		numPostsToGet, err = strconv.Atoi(cmd.arguments[0])
+		if err != nil {
+			return err
+		}
+	}
+	userPostsParams := database.GetPostsForUserParams{
+		UserID:		uuid.NullUUID{
+			UUID:	currentUser.ID,
+			Valid:	true,
+		},
+		Limit:		int32(numPostsToGet),
+	}
+	posts, err := s.db.GetPostsForUser(context.Background(), userPostsParams)
+	if err != nil {
+		return err
+	}
+	for _, post := range posts {
+		fmt.Println(html.EscapeString(post.Title.String))
+		fmt.Println(post.Url)
+		fmt.Println(post.PublishedAt)
+		fmt.Println(html.EscapeString(post.Description.String))
+	}
 	return nil
 }
 
@@ -337,4 +391,68 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	}
 
 	return rssFeed, nil
+}
+
+func scrapeFeeds(s *state) error {
+	dbFeed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return err
+	}
+	err = s.db.MarkFeedFetched(context.Background(), dbFeed.ID)
+	if err != nil {
+		return err
+	}
+	feed, err := fetchFeed(context.Background(), dbFeed.Url)
+	if err != nil {
+		return err
+	}
+	
+	for _, item := range feed.Channel.Item {
+		item.Title = html.EscapeString(item.Title)
+		item.Description = html.EscapeString(item.Description)
+		pubDateTime, err := time.Parse(dateFormatString, item.PubDate)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		postParams := database.CreatePostParams{
+			ID:				uuid.New(),
+			CreatedAt:  	time.Now(),
+			UpdatedAt:		time.Now(),
+			Title:			sql.NullString{
+				String:		item.Title,
+				Valid:		true,
+			},
+			Url:			item.Link,
+			Description:	sql.NullString{
+				String:		item.Description,
+				Valid:		true,
+			},
+			PublishedAt: 	sql.NullTime{
+				Time:	pubDateTime,
+				Valid:	true,
+			},
+			FeedID: 		uuid.NullUUID{
+				UUID:	dbFeed.ID,
+				Valid:	true,
+			},	
+		}
+		_, err = s.db.CreatePost(context.Background(), postParams)
+		if err != nil {
+			fmt.Println(err)
+		}
+		
+	}
+	return nil
+}
+
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error{
+	outFunction := func(s *state, cmd command) error {
+		user, err := s.db.GetUser(context.Background(), s.cfg.Current_user_name)
+		if err != nil {
+			return err
+		}
+		return handler(s, cmd, user)
+	}
+	return outFunction
 }
